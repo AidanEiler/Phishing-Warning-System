@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:http/http.dart' as http;
 import 'ai_service.dart';
 
+/// Minimal test that runs a single participant through a single session
+/// to verify the full pipeline works without exhausting API quota.
+/// Tests: persona generation, contextual warning generation,
+/// participant response simulation, and memory summary generation.
 class AiServiceTest extends StatefulWidget {
   const AiServiceTest({super.key});
 
@@ -11,45 +14,95 @@ class AiServiceTest extends StatefulWidget {
 }
 
 class _AiServiceTestState extends State<AiServiceTest> {
-  String _status = 'Press the button to test the Gemini API connection.';
+  String _status = 'Press the button to run a minimal pipeline test.';
   bool _isLoading = false;
 
+  /// A single hardcoded phishing stimulus for testing purposes
+  static const String _testConversation =
+      'Alex: Hey did you see the new server roles?\n'
+      'You: No, what happened?\n'
+      'Alex: The mods are giving out special roles to active members.';
+
+  static const String _testFinalMessage =
+      'Here is the link to claim your role: http://discord-roles-claim.net/verify';
+
+  static const String _testLink = 'http://discord-roles-claim.net/verify';
+
   Future<void> _runTest() async {
-  setState(() {
-    _isLoading = true;
-    _status = 'Testing basic network connectivity...';
-  });
-
-  try {
-    // Test basic connectivity first
-    final testResponse = await http.get(
-      Uri.parse('https://generativelanguage.googleapis.com/'),
-    ).timeout(const Duration(seconds: 10));
-    
-    setState(() => _status = 'Network reachable. Status: ${testResponse.statusCode}\nNow testing API...');
-
-    final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
-    final service = AiService(apiKey);
-    
-    setState(() => _status = '$_status\nGenerating persona...');
-    final persona = await service.generatePersona('TEST-001');
     setState(() {
-      _status = '$_status\n\nSuccess:\n$persona';
-      _isLoading = false;
+      _isLoading = true;
+      _status = 'Starting minimal pipeline test...\n';
     });
 
-  } catch (e) {
-    setState(() {
-      _status = 'ERROR TYPE: ${e.runtimeType}\nERROR: $e';
-      _isLoading = false;
-    });
+    try {
+      final apiKey = dotenv.env['GEMINI_API_KEY'] ?? '';
+      if (apiKey.isEmpty) {
+        setState(() {
+          _status = 'ERROR: GEMINI_API_KEY not found in .env file.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final service = AiService(apiKey);
+
+      /// Step 1: Generate persona (1 API call)
+      _appendStatus('Step 1: Generating persona...');
+      final personaMap = await service.generatePersona('TEST-001');
+      _appendStatus('Persona generated: $personaMap\n');
+
+      /// Step 2: Generate contextual warning (1 API call)
+      _appendStatus('Step 2: Generating contextual warning...');
+      final warning = await service.generateContextualWarning(
+        conversationContext: _testConversation,
+        suspiciousMessage: _testFinalMessage,
+        suspiciousLink: _testLink,
+      );
+      _appendStatus('Warning generated: $warning\n');
+
+      /// Step 3: Simulate participant response (1 API call)
+      _appendStatus('Step 3: Simulating participant response...');
+      final response = await service.simulateParticipantResponse(
+        persona: personaMap,
+        conversationContext: _testConversation,
+        finalMessage: _testFinalMessage,
+        warningText: warning,
+        deliveryMode: 'interruptive',
+        sessionNumber: 1,
+        memoryContext: '',
+      );
+      _appendStatus('Response simulated: $response\n');
+
+      /// Step 4: Generate memory summary (1 API call)
+      _appendStatus('Step 4: Generating memory summary...');
+      final memory = await service.generateMemorySummary(
+        sessionTranscript:
+            'Participant evaluated 1 stimulus. '
+            'Decision: ${response['detection_decision']}. '
+            'Confidence: ${response['confidence_rating']}.',
+        sessionNumber: 1,
+        previousMemory: null,
+      );
+      _appendStatus('Memory summary: $memory\n');
+
+      _appendStatus('All steps passed. Total API calls used: 4.');
+      setState(() => _isLoading = false);
+    } catch (e) {
+      setState(() {
+        _status = '$_status\nERROR: $e';
+        _isLoading = false;
+      });
+    }
   }
-}
+
+  void _appendStatus(String message) {
+    setState(() => _status = '$_status$message\n');
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Gemini API Test')),
+      appBar: AppBar(title: const Text('AI Service Test')),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -63,7 +116,7 @@ class _AiServiceTestState extends State<AiServiceTest> {
                       height: 20,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Text('Run API Test'),
+                  : const Text('Run Pipeline Test'),
             ),
             const SizedBox(height: 24),
             Expanded(

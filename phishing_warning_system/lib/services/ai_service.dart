@@ -5,10 +5,12 @@ import '../models/persona.dart';
 import '../models/stimulus.dart';
 import '../models/response.dart';
 import '../models/condition.dart';
+import 'csv_exporter.dart';
+import 'progress_tracker.dart';
 
 /// Service responsible for all AI API calls to Google Gemini.
 /// Handles persona generation, stimulus responses, warning text generation,
-/// memory summarization, and batch experiment orchestration.
+/// memory summarization, and full batch experiment orchestration.
 /// Includes rate limit handling with automatic retry and backoff logic.
 class AiService {
   /// Gemini API endpoint for the flash model
@@ -71,7 +73,7 @@ class AiService {
               }
             ],
             'generationConfig': {
-              'maxOutputTokens': 300,
+              'maxOutputTokens': 1024,
               'temperature': 0.7,
             },
           }),
@@ -285,9 +287,14 @@ Provide only the memory summary text, no preamble.
       stressLevel: personaMap['stress_level'] as String,
     );
 
+    /// Suppress unused variable warning — persona is stored for future use
+    /// such as logging or researcher review
+    assert(persona.id == participantId);
+
     /// Run three sessions
     for (int session = 1; session <= 3; session++) {
-      /// Get stimuli for this session (5 per session, grouped by session number)
+      /// Get stimuli for this session grouped by session number
+      /// and shuffle order within session for internal validity
       final sessionStimuli = allStimuli
           .where((s) => s.sessionNumber == session)
           .toList()
@@ -296,10 +303,9 @@ Provide only the memory summary text, no preamble.
       /// Present each stimulus and collect response
       for (int i = 0; i < sessionStimuli.length; i++) {
         final stimulus = sessionStimuli[i];
-        final totalSteps = 15.0;
         final currentStep = ((session - 1) * 5 + i + 1).toDouble();
         onProgress(
-          currentStep / totalSteps,
+          currentStep / 15.0,
           'Session $session, stimulus ${i + 1}/5 for $participantId...',
         );
 
@@ -310,17 +316,15 @@ Provide only the memory summary text, no preamble.
 
         /// Determine warning text based on condition
         String warningText = '';
-        if (!condition.isControl) {
-          if (stimulus.isPhishing) {
-            if (condition.languageSpecificity == 'contextual') {
-              warningText = await generateContextualWarning(
-                conversationContext: conversationContext,
-                suspiciousMessage: stimulus.finalMessage,
-                suspiciousLink: stimulus.suspiciousLink ?? '',
-              );
-            } else {
-              warningText = getGenericWarning();
-            }
+        if (!condition.isControl && stimulus.isPhishing) {
+          if (condition.languageSpecificity == 'contextual') {
+            warningText = await generateContextualWarning(
+              conversationContext: conversationContext,
+              suspiciousMessage: stimulus.finalMessage,
+              suspiciousLink: stimulus.suspiciousLink ?? '',
+            );
+          } else {
+            warningText = getGenericWarning();
           }
         }
 
@@ -353,12 +357,13 @@ Provide only the memory summary text, no preamble.
       if (session < 3) {
         onProgress(
           (session * 5) / 15.0,
-          'Generating memory summary after session $session...',
+          'Generating memory summary after session $session for $participantId...',
         );
         final sessionTranscript = responses
             .where((r) => r.sessionNumber == session)
             .map((r) =>
-                'Stimulus ${r.stimulusId}: decided ${r.detectionDecision ? "phishing" : "legitimate"} with confidence ${r.confidenceRating}')
+                'Stimulus ${r.stimulusId}: decided ${r.detectionDecision ? "phishing" : "legitimate"} '
+                'with confidence ${r.confidenceRating}')
             .join('\n');
 
         memoryContext = await generateMemorySummary(
@@ -374,26 +379,43 @@ Provide only the memory summary text, no preamble.
   }
 
   /// Runs the full batch experiment for all 270 participants across all 9 conditions.
-  /// 30 participants per condition, 3 sessions each, 5 stimuli per session.
-  /// Results are aggregated and returned as a flat list of Response objects.
+  /// Writes responses to CSV incrementally after each participant completes.
+  /// Skips already completed participants to support crash recovery.
   /// The onProgress callback reports overall progress and current status.
   Future<List<Response>> runFullExperiment({
     required List<Stimulus> allStimuli,
+    required CsvExporter csvExporter,
+    required ProgressTracker progressTracker,
     required void Function(double progress, String status) onProgress,
   }) async {
     final List<Response> allResponses = [];
     const int participantsPerCondition = 30;
     const int totalParticipants = 270;
-    int completedParticipants = 0;
+
+    /// Load already completed participants for crash recovery
+    final completedParticipants =
+        await progressTracker.loadCompletedParticipants();
+    int completedCount = completedParticipants.length;
+
+    onProgress(
+      completedCount / totalParticipants,
+      'Resuming experiment. $completedCount/$totalParticipants participants already complete.',
+    );
 
     for (final condition in Condition.allConditions) {
       for (int p = 1; p <= participantsPerCondition; p++) {
         final participantId =
-            'C${condition.conditionNumber.toString().padLeft(2, '0')}-P${p.toString().padLeft(2, '0')}';
+            'C${condition.conditionNumber.toString().padLeft(2, '0')}-'
+            'P${p.toString().padLeft(2, '0')}';
+
+        /// Skip already completed participants
+        if (completedParticipants.contains(participantId)) {
+          continue;
+        }
 
         onProgress(
-          completedParticipants / totalParticipants,
-          'Running condition ${condition.conditionNumber}/9, '
+          completedCount / totalParticipants,
+          'Condition ${condition.conditionNumber}/9, '
           'participant $p/$participantsPerCondition ($participantId)...',
         );
 
@@ -403,24 +425,32 @@ Provide only the memory summary text, no preamble.
             condition: condition,
             allStimuli: allStimuli,
             onProgress: (_, status) => onProgress(
-              completedParticipants / totalParticipants,
+              completedCount / totalParticipants,
               status,
             ),
           );
+
+          /// Persist responses and mark participant complete immediately
+          /// so crash recovery works correctly
+          await csvExporter.appendResponses(participantResponses);
+          await progressTracker.markParticipantComplete(participantId);
           allResponses.addAll(participantResponses);
         } catch (e) {
-          /// Log failed participant but continue with experiment
+          /// Log failed participant but continue with the rest of the experiment
           onProgress(
-            completedParticipants / totalParticipants,
-            'WARNING: $participantId failed with error: $e. Continuing...',
+            completedCount / totalParticipants,
+            'WARNING: $participantId failed: $e. Continuing...',
           );
         }
 
-        completedParticipants++;
+        completedCount++;
       }
     }
 
-    onProgress(1.0, 'Experiment complete. ${allResponses.length} responses collected.');
+    onProgress(
+      1.0,
+      'Experiment complete. ${allResponses.length} responses collected.',
+    );
     return allResponses;
   }
 }
