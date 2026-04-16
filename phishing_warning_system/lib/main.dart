@@ -1,4 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'services/ai_service_test.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+  runApp(const MaterialApp(home: AiServiceTest()));
+}
+/*
+import 'package:flutter/material.dart';
 
 void main() {
   runApp(const PhishingWarningApp());
@@ -374,3 +384,4 @@ class WarningModal extends StatelessWidget {
     );
   }
 }
+*/
